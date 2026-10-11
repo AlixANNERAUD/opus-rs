@@ -349,6 +349,17 @@ fn compute_mode_threshold(
     threshold
 }
 
+/// C `bits_to_bitrate` (opus_private.h, libopus 1.6): bits per frame to b/s,
+/// through the 6x frame rate so 60 ms frames (16.67 Hz) round like libopus.
+fn bits_to_bitrate(bits: i32, fs: i32, frame_size: usize) -> i32 {
+    (bits as i64 * (6 * fs as i64 / frame_size as i64) / 6) as i32
+}
+
+/// C `bitrate_to_bits` (opus_private.h, libopus 1.6): b/s to bits per frame.
+fn bitrate_to_bits(bitrate: i32, fs: i32, frame_size: usize) -> i32 {
+    (bitrate as i64 * 6 / (6 * fs as i64 / frame_size as i64)) as i32
+}
+
 /// SILK's share of a Hybrid packet's `rate_bps` (libopus
 /// `compute_silk_rate_for_hybrid`), allocated per channel: stereo codes the
 /// side with SILK too. Not ported: the FEC column, the CBR boost and the SWB
@@ -953,6 +964,22 @@ impl OpusEncoder {
             };
 
             let frame_ms = (frame_size as i32 * 1000) / self.sampling_rate;
+
+            // C opus_encoder.c `bits_target` / `total_bitRate` (1.6): SILK
+            // codes at the requested bitrate, capped by the packet budget,
+            // less the TOC byte. Under VBR the budget is the caller's output
+            // buffer, which must cap the rate, not set it (issue #43). CBR
+            // first re-quantizes the bitrate to the whole bytes it codes, as
+            // opus_encode_native does, so the cap is the packet itself.
+            let rate_bps = if self.use_cbr {
+                bits_to_bitrate(8 * n_bytes as i32, self.sampling_rate, frame_size)
+            } else {
+                self.bitrate_bps
+            };
+            let rate_bits = bitrate_to_bits(rate_bps, self.sampling_rate, frame_size);
+            let bits_target = (8 * n_bytes as i32).min(rate_bits) - 8;
+            let total_bitrate = bits_to_bitrate(bits_target, self.sampling_rate, frame_size);
+
             // C opus_encoder.c:1448-1455: (re)entering SILK/hybrid from CELT
             // resets the SILK encoder and prefills it with recent (ramped)
             // audio, so the first SILK frame starts from valid history.
@@ -973,13 +1000,11 @@ impl OpusEncoder {
                 self.silk_initialized = false;
             }
             if !self.silk_initialized || self.silk_enc.s_cmn.fs_khz != silk_fs_khz {
-                let silk_init_bitrate = (((n_bytes - 1) * 8) as i64 * self.sampling_rate as i64
-                    / frame_size as i64) as i32;
                 silk_control_encoder(
                     state_mut(&mut self.silk_enc),
                     silk_fs_khz,
                     frame_ms,
-                    silk_init_bitrate,
+                    total_bitrate,
                     self.complexity,
                 );
                 self.silk_enc.s_cmn.use_cbr = if self.use_cbr { 1 } else { 0 };
@@ -1004,7 +1029,7 @@ impl OpusEncoder {
                         side,
                         silk_fs_khz,
                         frame_ms,
-                        silk_init_bitrate,
+                        total_bitrate,
                         self.complexity,
                     );
                     side.s_cmn.use_cbr = self.silk_enc.s_cmn.use_cbr;
@@ -1026,19 +1051,13 @@ impl OpusEncoder {
 
             let silk_frame_len_samples =
                 frame_size * silk_fs_khz as usize / (self.sampling_rate.max(1000) / 1000) as usize;
-            let silk_rate_for_calc = if mode == OpusMode::Hybrid {
-                16000
-            } else {
-                self.sampling_rate
-            };
-            let silk_frame_len = silk_frame_len_samples;
             let silk_bitrate = if mode == OpusMode::Hybrid {
                 let frame_duration_ms = frame_size as i32 * 1000 / self.sampling_rate;
                 let frame20ms = frame_duration_ms >= 20;
                 compute_silk_rate_for_hybrid(self.bitrate_bps, frame20ms, self.channels)
             } else {
-                (8i64 * (n_bytes - 1) as i64 * silk_rate_for_calc as i64 / silk_frame_len as i64)
-                    as i32
+                // C: SILK gets all bits, at the requested rate (issue #43).
+                total_bitrate
             };
 
             // C opus_encoder.c:1806-1826: prefill the fresh SILK encoder with
@@ -1196,8 +1215,8 @@ impl OpusEncoder {
             let silk_max_bits = if mode == OpusMode::Hybrid {
                 let total_max_bits = ((n_bytes - 1) * 8) as i32;
                 if self.use_cbr {
-                    let silk_bits = (silk_bitrate as i64 * silk_frame_len as i64
-                        / silk_rate_for_calc as i64) as i32;
+                    let silk_bits = (silk_bitrate as i64 * frame_size as i64
+                        / self.sampling_rate as i64) as i32;
                     let other_bits = 0i32.max(total_max_bits - silk_bits);
                     0i32.max(total_max_bits - other_bits * 3 / 4)
                 } else {
